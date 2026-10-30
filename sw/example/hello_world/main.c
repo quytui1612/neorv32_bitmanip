@@ -1,0 +1,278 @@
+// ================================================================================ //
+// NEORV32 Full Cipher Benchmark — With Cache (ICACHE 4KB + DCACHE 4KB)            //
+// -------------------------------------------------------------------------------- //
+// All benchmarks: ENCRYPT-ONLY (key expansion cached, not measured)               //
+// Methodology: Same C code compiled with 2 different MARCH flags                  //
+//                                                                                  //
+// BM:  rv32imc_zba_zbb_zbs_zbkb_zbkc_zbkx_zkne_zknd_zicsr_zifencei              //
+// BASE: rv32imc_zicsr_zifencei                                                   //
+//                                                                                  //
+// Bitmanip benefit = same code, 2 MARCH (not algorithm comparison).               //
+// Cache: ICACHE 64 blocks × 64B = 4KB, DCACHE 64 blocks × 64B = 4KB              //
+// ================================================================================ //
+
+#include <neorv32.h>
+#include <stdint.h>
+#include <string.h>
+#include "aes.h"
+#include "aes_zkne.h"
+#include "aes_wp.h"
+#include "aes_bm.h"
+#include "aes_ttable.h"
+#include "mkv_wp.h"
+#include "mkv_ttable.h"
+#include "magma.h"
+#include "speck.h"
+#include "speck_fast.h"
+#include "lea.h"
+#include "chacha.h"
+#include "present.h"
+#include "xcipher.h"
+#ifndef EXCLUDE_EXTRA_CIPHERS
+#include "simon.h"
+#include "prince.h"
+#include "speck128.h"
+#endif
+
+#define BAUD_RATE 19200
+
+static void print_u32(uint32_t v) {
+  char buf[11]; int i = 10; buf[i] = 0;
+  if (!v) { neorv32_uart0_puts("0"); return; }
+  while (v && i > 0) { buf[--i] = '0' + (v % 10u); v /= 10u; }
+  neorv32_uart0_puts(buf + i);
+}
+
+static void header(const char *t) {
+  neorv32_uart0_puts("\n##### ");
+  neorv32_uart0_puts(t);
+  neorv32_uart0_puts(" #####\n");
+}
+
+/* ----------------------------------------------------------------------- */
+/* Benchmark runner: 1000 iterations, encrypt-only                         */
+/* ----------------------------------------------------------------------- */
+static uint32_t bench(const char *label,
+                      void (*fn)(const uint8_t*,const uint8_t*,uint8_t*),
+                      const uint8_t *key, const uint8_t *pt,
+                      uint32_t bits) {
+  const uint32_t N=1000; uint8_t out[16];
+  uint64_t t0=neorv32_cpu_get_cycle();
+  for (uint32_t i=0;i<N;i++) fn(key,pt,out);
+  uint64_t t1=neorv32_cpu_get_cycle();
+  uint32_t cy=(uint32_t)(t1-t0); uint32_t c=cy/N;
+  uint32_t tp=(uint32_t)(((uint64_t)N*bits*NEORV32_SYSINFO->CLK)/cy/1000u);
+  neorv32_uart0_puts(label); neorv32_uart0_puts("cyc=");
+  print_u32(c); neorv32_uart0_puts(" tp="); print_u32(tp); neorv32_uart0_puts("kbps\n");
+  return c;
+}
+
+static void speedup(const char*tag, uint32_t base, uint32_t fast) {
+  neorv32_uart0_puts(tag);
+  if (!fast||!base||fast>=base) { neorv32_uart0_puts("N/A\n"); return; }
+  uint32_t pct=((base-fast)*100u)/base;
+  neorv32_uart0_puts("+"); print_u32(pct); neorv32_uart0_puts("% (");
+  print_u32(base); neorv32_uart0_puts("->"); print_u32(fast); neorv32_uart0_puts(")\n");
+}
+
+/* ----------------------------------------------------------------------- */
+/* AES: cached key wrappers (encrypt-only)                                 */
+/* ----------------------------------------------------------------------- */
+static struct AES_ctx g_aes;
+static uint8_t g_k[16];
+static int g_rdy = 0;
+
+static void aes_soft(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_rdy || memcmp(key,g_k,16)) { AES_init_ctx(&g_aes,key); memcpy(g_k,key,16); g_rdy=1; }
+  memcpy(out,in,16); AES_ECB_encrypt(&g_aes,out);
+}
+
+static void aes_wp(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_rdy || memcmp(key,g_k,16)) { AES_init_ctx(&g_aes,key); memcpy(g_k,key,16); g_rdy=1; }
+  aes128_ecb_encrypt_wp_rk((const uint32_t *)g_aes.RoundKey, in, out);
+}
+
+#ifdef __riscv_zkne
+static void aes_zkne(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_rdy || memcmp(key,g_k,16)) { AES_init_ctx(&g_aes,key); memcpy(g_k,key,16); g_rdy=1; }
+  aes128_ecb_encrypt_zkne_rk((const uint32_t *)g_aes.RoundKey, in, out);
+}
+#endif
+
+/* ----------------------------------------------------------------------- */
+/* MKV: cached key wrappers (encrypt-only)                                 */
+/* ----------------------------------------------------------------------- */
+static mkv_wp_ctx_t g_mkv;
+static uint8_t g_mkv_k[16]; static int g_mkv_r = 0;
+
+static void mkv_enc_wp(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_mkv_r || memcmp(key,g_mkv_k,16)) {
+    mkv_wp_init(&g_mkv, MKV_ROUNDS_128, key);
+    memcpy(g_mkv_k,key,16); g_mkv_r=1;
+  }
+  mkv_wp_encrypt(&g_mkv, in, out);
+}
+
+static void mkv_enc_opt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_mkv_r || memcmp(key,g_mkv_k,16)) {
+    mkv_wp_init(&g_mkv, MKV_ROUNDS_128, key);
+    memcpy(g_mkv_k,key,16); g_mkv_r=1;
+  }
+  mkv_wp_encrypt_opt(&g_mkv, in, out);
+}
+
+static void mkv_enc_tt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_mkv_r || memcmp(key,g_mkv_k,16)) {
+    mkv_ttable_keysched(&g_mkv, MKV_ROUNDS_128, key);
+    memcpy(g_mkv_k,key,16); g_mkv_r=1;
+  }
+  mkv_ttable_encrypt(&g_mkv, in, out);
+}
+
+/* ----------------------------------------------------------------------- */
+/* Speck: cached key wrapper (encrypt-only)                                */
+/* ----------------------------------------------------------------------- */
+static speck_ctx_t g_speck;
+static uint8_t g_sk[16]; static int g_sr = 0;
+
+static void speck_enc(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  if (!g_sr || memcmp(key,g_sk,16)) {
+    speck_init(&g_speck, key); memcpy(g_sk,key,16); g_sr=1;
+  }
+  speck_encrypt(&g_speck, in, out);
+}
+
+/* ----------------------------------------------------------------------- */
+/* Main                                                                     */
+/* ----------------------------------------------------------------------- */
+int main(void) {
+  neorv32_rte_setup();
+  neorv32_uart0_setup(BAUD_RATE,0);
+
+  neorv32_uart0_puts("\n==========================================\n");
+  neorv32_uart0_puts("NEORV32 Full Cipher Benchmark\n");
+  neorv32_uart0_puts("Methodology: ENCRYPT-ONLY (key cached)\n");
+  neorv32_uart0_puts("Cache: ICACHE 4KB + DCACHE 4KB\n");
+#ifdef __riscv_zbb
+  neorv32_uart0_puts("BUILD: BITMANIP\n");
+#else
+  neorv32_uart0_puts("BUILD: BASELINE\n");
+#endif
+  neorv32_uart0_puts("==========================================\n");
+
+  const uint8_t key[16]={0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,
+                         0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c};
+  const uint8_t pt[16]={0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+                        0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a};
+
+  /* Init T-tables */
+  aes_ttable_init();
+  mkv_ttable_init();
+
+  /* ===== AES-128 (encrypt-only) ===== */
+  header("AES-128 (encrypt-only)");
+  uint32_t c1=bench("[1]Soft   ",aes_soft,key,pt,128);
+  uint32_t c2=bench("[2]WP     ",aes_wp,key,pt,128);
+#ifdef __riscv_zkne
+  uint32_t c3=bench("[3]Zkne   ",aes_zkne,key,pt,128);
+#else
+  neorv32_uart0_puts("[3]Zkne   skipped\n"); uint32_t c3=0;
+#endif
+  uint32_t c4=bench("[4]TTable ",aes_ttable_bench,key,pt,128);
+  uint32_t c5=bench("[5]WordBM ",aes_bm_bench,key,pt,128);
+
+  neorv32_uart0_puts("\n-- AES Algorithm Comparison (same MARCH) --\n");
+  speedup("WP vs Soft:     ",c1,c2);
+  if(c3) speedup("Zkne vs Soft:   ",c1,c3);
+  speedup("TTable vs Soft: ",c1,c4);
+  speedup("WordBM vs Soft: ",c1,c5);
+
+  /* ===== MKV-128 (encrypt-only) ===== */
+  header("MKV-128 (encrypt-only)");
+  {
+    int st = mkv_wp_selftest();
+    neorv32_uart0_puts("Self-test: 0x");
+    char hex[9]; for(int i=7;i>=0;i--){hex[7-i]="0123456789ABCDEF"[(st>>(i*4))&0xF];} hex[8]=0;
+    neorv32_uart0_puts(hex);
+    neorv32_uart0_puts(st==0x2F ? " PASS\n" : " FAIL\n");
+  }
+  uint32_t cM1=bench("[1]WP     ",mkv_enc_wp,key,pt,128);
+  uint32_t cM2=bench("[2]Opt    ",mkv_enc_opt,key,pt,128);
+  uint32_t cM3=bench("[3]TTable ",mkv_enc_tt,key,pt,128);
+
+  neorv32_uart0_puts("\n-- MKV Algorithm Comparison --\n");
+  speedup("Opt vs WP:       ",cM1,cM2);
+  speedup("TTable vs WP:    ",cM1,cM3);
+
+  /* ===== Magma GOST (encrypt-only) ===== */
+  header("Magma GOST (encrypt-only)");
+  uint32_t cG1=bench("[A]Prerot ",magma_bench_prerot,key,pt,64);
+  uint32_t cG2=bench("[B]Rori   ",magma_bench_rori,key,pt,64);
+  speedup("Rori vs Prerot:  ",cG1,cG2);
+
+  /* ===== Speck-64/128 (encrypt-only) ===== */
+  header("Speck-64/128 (encrypt-only)");
+  uint32_t cS1=bench("[S]Standard",speck_enc,key,pt,64);
+  uint32_t cS2=bench("[F]Fast   ",speck_fast_bench,key,pt,64);
+  speedup("Fast vs Standard:",cS1,cS2);
+
+  /* ===== LEA-128 (encrypt-only) ===== */
+  header("LEA-128 (encrypt-only)");
+  uint32_t cL=bench("[L]EncOnly",lea_bench_encrypt_only,key,pt,128);
+
+  /* ===== ChaCha20 (encrypt-only) ===== */
+  header("ChaCha20 (encrypt-only)");
+  uint32_t cC=bench("[C]Block  ",chacha_bench,key,pt,512);
+
+  /* ===== PRESENT-80 (encrypt-only) ===== */
+  header("PRESENT-80 (encrypt-only)");
+  uint32_t cP=bench("[P]Present",present_bench_encrypt_only,key,pt,64);
+
+  /* ===== XCipher (encrypt-only) ===== */
+  header("XCipher (encrypt-only)");
+  uint32_t cX=bench("[X]XCipher",xc_bench_encrypt_only,key,pt,64);
+
+#ifndef EXCLUDE_EXTRA_CIPHERS
+  /* ===== Simon-64/128 (encrypt-only) ===== */
+  header("Simon-64/128 (encrypt-only)");
+  uint32_t cSi=bench("[S]Simon  ",simon_bench_encrypt_only,key,pt,64);
+
+  /* ===== Speck-128/128 (encrypt-only) ===== */
+  header("Speck-128/128 (encrypt-only)");
+  uint32_t cSp128=bench("[S]Speck128",speck128_bench_encrypt_only,key,pt,128);
+
+  /* ===== PRINCE (encrypt-only) ===== */
+  header("PRINCE (encrypt-only)");
+  uint32_t cPr=bench("[P]PRINCE ",prince_bench_encrypt_only,key,pt,64);
+#endif
+
+  /* ===== Cross-cipher comparison ===== */
+  neorv32_uart0_puts("\n===== CROSS-CIPHER SUMMARY (encrypt-only) =====\n");
+  neorv32_uart0_puts("AES-Soft  : "); print_u32(c1); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("AES-WP    : "); print_u32(c2); neorv32_uart0_puts(" cyc\n");
+  if(c3){ neorv32_uart0_puts("AES-Zkne  : "); print_u32(c3); neorv32_uart0_puts(" cyc\n"); }
+  neorv32_uart0_puts("AES-TTab  : "); print_u32(c4); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("AES-WordBM: "); print_u32(c5); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("MKV-WP    : "); print_u32(cM1); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("MKV-Opt   : "); print_u32(cM2); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("MKV-TTab  : "); print_u32(cM3); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("Magma-Prer: "); print_u32(cG1); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("Magma-Rori: "); print_u32(cG2); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("Speck-Std : "); print_u32(cS1); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("Speck-Fast: "); print_u32(cS2); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("LEA-Enc   : "); print_u32(cL); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("ChaCha    : "); print_u32(cC); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("PRESENT   : "); print_u32(cP); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("XCipher   : "); print_u32(cX); neorv32_uart0_puts(" cyc\n");
+#ifndef EXCLUDE_EXTRA_CIPHERS
+  neorv32_uart0_puts("Simon     : "); print_u32(cSi); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("Speck128  : "); print_u32(cSp128); neorv32_uart0_puts(" cyc\n");
+  neorv32_uart0_puts("PRINCE    : "); print_u32(cPr); neorv32_uart0_puts(" cyc\n");
+#endif
+
+  neorv32_uart0_puts("\nDone.\n");
+  while(neorv32_uart0_tx_busy());
+  asm volatile("li t0,0xFFE00000; jr t0");
+  __builtin_unreachable();
+  return 0;
+}

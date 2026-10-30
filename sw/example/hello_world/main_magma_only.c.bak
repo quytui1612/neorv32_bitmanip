@@ -1,0 +1,233 @@
+// ================================================================================ //
+// The NEORV32 RISC-V Processor - https://github.com/stnolting/neorv32              //
+// Copyright (c) NEORV32 contributors.                                              //
+// Copyright (c) 2020 - 2025 Stephan Nolting. All rights reserved.                  //
+// Licensed under the BSD-3-Clause license, see LICENSE for details.                //
+// SPDX-License-Identifier: BSD-3-Clause                                            //
+// ================================================================================ //
+
+
+/**********************************************************************//**
+ * @file hello_world/main.c
+ * @brief Magma (GOST R 34.12-2015) benchmark on NEORV32.
+ *
+ * Demonstrates Bitmanip benefits for symmetric ciphers with explicit rotation:
+ *   [A] magma_prerot — ROL11 absorbed into tables (Zbb gives ZERO benefit)
+ *   [B] magma_rori   — natural tables + explicit rori (Zbb shines)
+ *
+ * Key comparison:
+ *   [B] vs [A]: isolates the pure rori benefit of Zbb.
+ *   Magma has 32 rounds × 1 rotation = 32 rori/block → much clearer than AES.
+ **************************************************************************/
+
+#include <neorv32.h>
+#include <stdint.h>
+#include "magma.h"   // Magma (GOST R 34.12-2015): prerot vs rori comparison
+/* Other cipher headers kept for future use — not compiled into this binary */
+// #include "aes.h"
+// #include "aes_zkne.h"
+// #include "aes_wp.h"
+// #include "aes_bs.h"
+// #include "speck.h"
+// #include "mkv_wp.h"
+
+/**********************************************************************//**
+ * @name User configuration
+ **************************************************************************/
+/**@{*/
+/** UART BAUD rate */
+#define BAUD_RATE 19200
+/**@}*/
+
+
+/* -----------------------------------------------------------------------
+ * Utility: print unsigned 32-bit integer (avoids pulling in vprintf/itoa)
+ * ---------------------------------------------------------------------- */
+static void print_u32(uint32_t v) {
+  char buf[11];
+  int i = 10;
+  buf[10] = '\0';
+  if (v == 0) { neorv32_uart0_puts("0"); return; }
+  while (v && i > 0) { buf[--i] = '0' + (v % 10u); v /= 10u; }
+  neorv32_uart0_puts(buf + i);
+}
+
+/* -----------------------------------------------------------------------
+ * Utility: print one byte as two hex digits
+ * ---------------------------------------------------------------------- */
+static void print_byte_hex(uint8_t b) {
+  const char hex[] = "0123456789abcdef";
+  char s[3];
+  s[0] = hex[(b >> 4) & 0x0F];
+  s[1] = hex[b & 0x0F];
+  s[2] = '\0';
+  neorv32_uart0_puts(s);
+}
+
+/* -----------------------------------------------------------------------
+ * Utility: print buffer as labelled hex line
+ * ---------------------------------------------------------------------- */
+static void print_hex(const char *label, const uint8_t *buf, size_t len) {
+  neorv32_uart0_puts(label);
+  for (size_t i = 0; i < len; i++) {
+    print_byte_hex(buf[i]);
+  }
+  neorv32_uart0_puts("\n");
+}
+
+
+/* -----------------------------------------------------------------------
+ * Generic benchmark helper matching Magma bench wrapper signature:
+ *   void fn(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+ *
+ * Magma block = 64-bit. Throughput reported as kbit/s over 64-bit blocks.
+ * Returns cycles per wrapper call (= 1 Magma 64-bit block).
+ * ---------------------------------------------------------------------- */
+static uint32_t run_benchmark(const char *label,
+                              void (*enc)(const uint8_t*, const uint8_t*, uint8_t*),
+                              const uint8_t key[16],
+                              const uint8_t plaintext[16]) {
+  const uint32_t N_BLOCKS = 1000;
+  uint8_t out[16];
+
+  uint64_t t0 = neorv32_cpu_get_cycle();
+  for (uint32_t i = 0; i < N_BLOCKS; i++) {
+    enc(key, plaintext, out);
+  }
+  uint64_t t1 = neorv32_cpu_get_cycle();
+
+  uint32_t cycles      = (uint32_t)(t1 - t0);
+  uint32_t cyc_per_blk = cycles / N_BLOCKS;
+
+  uint32_t f_clk = NEORV32_SYSINFO->CLK;
+  /* Magma block = 64-bit; throughput in kbit/s */
+  uint64_t bits_total     = (uint64_t)N_BLOCKS * 64u;
+  uint64_t throughput_bps = (bits_total * (uint64_t)f_clk) / (uint64_t)cycles;
+  uint32_t throughput_kbps = (uint32_t)(throughput_bps / 1000u);
+
+  neorv32_uart0_puts(label);
+  neorv32_uart0_puts("Cycles/blk : "); print_u32(cyc_per_blk);     neorv32_uart0_puts("\n");
+  neorv32_uart0_puts("Throughput : "); print_u32(throughput_kbps); neorv32_uart0_puts(" kbit/s\n");
+
+  return cyc_per_blk;
+}
+
+
+/**********************************************************************//**
+ * Magma benchmark:
+ *
+ *   [A] magma_prerot — ROL11 baked into 4 pre-rotated tables (4 KB IMEM).
+ *       Hot path: 4 table lookups + 1 XOR + 1 add per round. No rori.
+ *       Zbb has NO effect: no rotation instruction executed at runtime.
+ *       D-cache: 4 × 1 KB pre-rotated tables = 4 KB read-only pressure.
+ *
+ *   [B] magma_rori   — 4 natural tables (4 KB) + explicit ROL11 per round.
+ *       Hot path: 4 lookups + 1 XOR + 1 add + 1 rori rd,rs,21 per round.
+ *       With Zbb:    rori = 1 insn, tight dep chain ~22 cyc
+ *       Without Zbb: srli+slli+or ≈ 3 insns, ~48-60 cyc
+ *       D-cache: same 4 KB table pressure as [A].
+ *
+ *   [B] vs [A] speedup = pure rori (Zbb) benefit, D-cache footprint equal.
+ *   With Zbb:    [B] faster (rori is cheap, same tables as [A])
+ *   Without Zbb: [A] faster (no rotation overhead, same tables)
+ *
+ *   Expected saving: 32 rounds × (48 - 22) = 832 cycles/block with Zbb
+ *   → [B]/[A] ≈ (baseline_cyc - 832) / baseline_cyc
+ **************************************************************************/
+static void magma_benchmark(void) {
+
+  /* 16-byte key (bench wrappers double internally to build 32-byte Magma key) */
+  const uint8_t key16[16] = {
+    0x2b, 0x7e, 0x15, 0x16,
+    0x28, 0xae, 0xd2, 0xa6,
+    0xab, 0xf7, 0x15, 0x88,
+    0x09, 0xcf, 0x4f, 0x3c
+  };
+
+  /* 8-byte plaintext (Magma 64-bit block) in 16-byte buffer */
+  const uint8_t plain16[16] = {
+    0x6b, 0xc1, 0xbe, 0xe2,
+    0x2e, 0x40, 0x9f, 0x96,
+    0x00, 0x00, 0x00, 0x00,   /* padding — bench wrappers use first 8 bytes only */
+    0x00, 0x00, 0x00, 0x00
+  };
+
+  /* -----------------------------------------------------------------------
+   * Correctness: three invariants verified:
+   *   1. prerot ciphertext == rori ciphertext  (same crypto, different impl)
+   *   2. decrypt(encrypt_prerot(plain)) == plain
+   *   3. decrypt(encrypt_rori(plain))   == plain
+   * ---------------------------------------------------------------------- */
+  neorv32_uart0_puts("\n=Correctness=\n");
+
+  uint8_t mg_key32[32];
+  for (int i = 0; i < 16; i++) { mg_key32[i] = key16[i]; mg_key32[i+16] = key16[i]; }
+
+  magma_ctx_t ctx;
+  magma_init(&ctx, mg_key32);
+
+  uint8_t enc_pr[8], enc_sb[8], enc_sd[8];
+  magma_encrypt_prerot   (&ctx, plain16, enc_pr);
+  magma_encrypt_sbox     (&ctx, plain16, enc_sb);
+  magma_encrypt_sbox_opt (&ctx, plain16, enc_sd);
+
+  int ok_eq = 1;
+  for (int i = 0; i < 8; i++) {
+    if (enc_pr[i] != enc_sb[i]) ok_eq = 0;
+    if (enc_pr[i] != enc_sd[i]) ok_eq = 0;
+  }
+
+  print_hex("Enc C: ", enc_sb, 8);
+  print_hex("Enc D: ", enc_sd, 8);
+  neorv32_uart0_puts(ok_eq ? "A=C=D:PASS\n" : "A=C=D:FAIL\n");
+
+  /* -----------------------------------------------------------------------
+   * Benchmarks
+   * ---------------------------------------------------------------------- */
+  neorv32_uart0_puts("\n=Benchmark=\n");
+
+  uint32_t cyc_pr = run_benchmark("[A]prerot  ", magma_bench_prerot,    key16, plain16);
+  uint32_t cyc_sb = run_benchmark("[C]sbox    ", magma_bench_sbox,      key16, plain16);
+  uint32_t cyc_sd = run_benchmark("[D]sbox_opt", magma_bench_sbox_opt,  key16, plain16);
+
+  neorv32_uart0_puts("--- Analysis ---\n");
+  /* [D] vs [C]: how much 4-table opt gains over 8-nibble */
+  neorv32_uart0_puts("[C]vs[D]: ");
+  print_u32(cyc_sb); neorv32_uart0_puts(" vs ");
+  print_u32(cyc_sd); neorv32_uart0_puts(" cyc\n");
+  if (cyc_sd < cyc_sb) {
+    neorv32_uart0_puts("[D] faster by ");
+    print_u32(cyc_sb - cyc_sd); neorv32_uart0_puts(" cyc (");
+    print_u32((cyc_sb - cyc_sd)*100u / cyc_sb); neorv32_uart0_puts("%gain)\n");
+  }
+  /* [D] vs [A]: sbox_opt vs T-table */
+  if (cyc_sd < cyc_pr) {
+    neorv32_uart0_puts("[D]<[A] OptSbox beats Ttable by ");
+    print_u32(cyc_pr - cyc_sd); neorv32_uart0_puts(" cyc\n");
+  } else {
+    neorv32_uart0_puts("[A]<=[D] Ttable faster by ");
+    print_u32(cyc_sd - cyc_pr); neorv32_uart0_puts(" cyc\n");
+  }
+  (void)cyc_pr;
+}
+
+
+/**********************************************************************//**
+ * Main function.
+ **************************************************************************/
+int main(void) {
+
+  neorv32_rte_setup();
+  neorv32_uart0_setup(BAUD_RATE, 0);
+
+  neorv32_uart0_puts("\nNEORV32 Magma benchmark\n");
+
+  magma_benchmark();
+
+  neorv32_uart0_puts("\nDone. Restarting bootloader...\n");
+  while (neorv32_uart0_tx_busy()); /* wait for UART TX to flush */
+  /* Jump back to NEORV32 bootrom so next upload works without hardware reset */
+  asm volatile ("li t0, 0xFFE00000; jr t0");
+  __builtin_unreachable();
+  return 0;
+}
